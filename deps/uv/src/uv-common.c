@@ -33,6 +33,74 @@
 # include <net/if.h> /* if_nametoindex */
 #endif
 
+
+typedef struct {
+  uv_malloc_func local_malloc;
+  uv_realloc_func local_realloc;
+  uv_calloc_func local_calloc;
+  uv_free_func local_free;
+} uv__allocator_t;
+
+static uv__allocator_t uv__allocator = {
+  malloc,
+  realloc,
+  calloc,
+  free,
+};
+
+char* uv__strdup(const char* s) {
+  size_t len = strlen(s) + 1;
+  char* m = uv__malloc(len);
+  if (m == NULL)
+    return NULL;
+  return memcpy(m, s, len);
+}
+
+char* uv__strndup(const char* s, size_t n) {
+  char* m;
+  size_t len = strlen(s);
+  if (n < len)
+    len = n;
+  m = uv__malloc(len + 1);
+  if (m == NULL)
+    return NULL;
+  m[len] = '\0';
+  return memcpy(m, s, len);
+}
+
+void* uv__malloc(size_t size) {
+  return uv__allocator.local_malloc(size);
+}
+
+void uv__free(void* ptr) {
+  uv__allocator.local_free(ptr);
+}
+
+void* uv__calloc(size_t count, size_t size) {
+  return uv__allocator.local_calloc(count, size);
+}
+
+void* uv__realloc(void* ptr, size_t size) {
+  return uv__allocator.local_realloc(ptr, size);
+}
+
+int uv_replace_allocator(uv_malloc_func malloc_func,
+                         uv_realloc_func realloc_func,
+                         uv_calloc_func calloc_func,
+                         uv_free_func free_func) {
+  if (malloc_func == NULL || realloc_func == NULL ||
+      calloc_func == NULL || free_func == NULL) {
+    return UV_EINVAL;
+  }
+
+  uv__allocator.local_malloc = malloc_func;
+  uv__allocator.local_realloc = realloc_func;
+  uv__allocator.local_calloc = calloc_func;
+  uv__allocator.local_free = free_func;
+
+  return 0;
+}
+
 #define XX(uc, lc) case UV_##uc: return sizeof(uv_##lc##_t);
 
 size_t uv_handle_size(uv_handle_type type) {
@@ -379,15 +447,28 @@ int uv_fs_event_getpath(uv_fs_event_t* handle, char* buffer, size_t* size) {
   return 0;
 }
 
+/* The windows implementation does not have the same structure layout as
+ * the unix implementation (nbufs is not directly inside req but is
+ * contained in a nested union/struct) so this function locates it.
+*/
+static unsigned int* uv__get_nbufs(uv_fs_t* req) {
+#ifdef _WIN32
+  return &req->fs.info.nbufs;
+#else
+  return &req->nbufs;
+#endif
+}
 
 void uv__fs_scandir_cleanup(uv_fs_t* req) {
   uv__dirent_t** dents;
 
+  unsigned int* nbufs = uv__get_nbufs(req);
+
   dents = req->ptr;
-  if (req->nbufs > 0 && req->nbufs != (unsigned int) req->result)
-    req->nbufs--;
-  for (; req->nbufs < (unsigned int) req->result; req->nbufs++)
-    free(dents[req->nbufs]);
+  if (*nbufs > 0 && *nbufs != (unsigned int) req->result)
+    (*nbufs)--;
+  for (; *nbufs < (unsigned int) req->result; (*nbufs)++)
+    uv__free(dents[*nbufs]);
 }
 
 
@@ -395,20 +476,22 @@ int uv_fs_scandir_next(uv_fs_t* req, uv_dirent_t* ent) {
   uv__dirent_t** dents;
   uv__dirent_t* dent;
 
+  unsigned int* nbufs = uv__get_nbufs(req);
+
   dents = req->ptr;
 
   /* Free previous entity */
-  if (req->nbufs > 0)
-    free(dents[req->nbufs - 1]);
+  if (*nbufs > 0)
+    uv__free(dents[*nbufs - 1]);
 
   /* End was already reached */
-  if (req->nbufs == (unsigned int) req->result) {
-    free(dents);
+  if (*nbufs == (unsigned int) req->result) {
+    uv__free(dents);
     req->ptr = NULL;
     return UV_EOF;
   }
 
-  dent = dents[req->nbufs++];
+  dent = dents[(*nbufs)++];
 
   ent->name = dent->d_name;
 #ifdef HAVE_DIRENT_TYPES
@@ -477,12 +560,12 @@ uv_loop_t* uv_default_loop(void) {
 uv_loop_t* uv_loop_new(void) {
   uv_loop_t* loop;
 
-  loop = malloc(sizeof(*loop));
+  loop = uv__malloc(sizeof(*loop));
   if (loop == NULL)
     return NULL;
 
   if (uv_loop_init(loop)) {
-    free(loop);
+    uv__free(loop);
     return NULL;
   }
 
@@ -522,7 +605,8 @@ void uv_loop_delete(uv_loop_t* loop) {
   default_loop = default_loop_ptr;
 
   err = uv_loop_close(loop);
+  (void) err;    /* Squelch compiler warnings. */
   assert(err == 0);
   if (loop != default_loop)
-    free(loop);
+    uv__free(loop);
 }
